@@ -1,65 +1,122 @@
 import os
 import json
-import socket
+import time
 import sys
 from datetime import datetime
 
+import boto3
+
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
+QUEUE_URL = os.getenv("SQS_QUEUE_URL")
 
-HSM_HOST = os.getenv("HSM_HOST")
-HSM_PORT = int(os.getenv("HSM_PORT", "2223"))
-CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", "5"))
-
-# Pipe から渡したい値があればここで受ける
-PAYLOAD_JSON = os.getenv("PAYLOAD_JSON", "")
-
-
-def load_payload():
-    if not PAYLOAD_JSON:
-        return {}
-    try:
-        return json.loads(PAYLOAD_JSON)
-    except Exception as e:
-        raise RuntimeError(f"PAYLOAD_JSON parse error: {e}")
+WAIT_TIME_SECONDS = int(os.getenv("WAIT_TIME_SECONDS", "10"))   # long polling
+MAX_NUMBER_OF_MESSAGES = int(os.getenv("MAX_NUMBER_OF_MESSAGES", "1"))
+VISIBILITY_TIMEOUT = int(os.getenv("VISIBILITY_TIMEOUT", "30"))
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "2"))
 
 
-def check_hsm_connectivity(host: str, port: int, timeout_sec: int):
-    with socket.create_connection((host, port), timeout=timeout_sec):
-        return True
+if not QUEUE_URL:
+    raise RuntimeError("Missing env: SQS_QUEUE_URL")
+
+sqs = boto3.client("sqs", region_name=AWS_REGION)
 
 
-def main():
-    if not HSM_HOST:
-        raise RuntimeError("Missing env: HSM_HOST")
+def now():
+    return datetime.utcnow().isoformat() + "Z"
 
-    payload = load_payload()
 
-    request_id = payload.get("request_id", "no-request-id")
-    action = payload.get("action", "no-action")
-    source = payload.get("source", "unknown")
+def receive_messages():
+    response = sqs.receive_message(
+        QueueUrl=QUEUE_URL,
+        MaxNumberOfMessages=MAX_NUMBER_OF_MESSAGES,
+        WaitTimeSeconds=WAIT_TIME_SECONDS,
+        VisibilityTimeout=VISIBILITY_TIMEOUT,
+        MessageAttributeNames=["All"],
+        AttributeNames=["All"],
+    )
+    return response.get("Messages", [])
 
-    print("=== ECS HSM Worker Start ===")
+
+def delete_message(receipt_handle: str):
+    sqs.delete_message(
+        QueueUrl=QUEUE_URL,
+        ReceiptHandle=receipt_handle
+    )
+
+
+def process_message(message: dict):
+    message_id = message.get("MessageId")
+    receipt_handle = message.get("ReceiptHandle")
+    body_raw = message.get("Body", "{}")
+
+    print("=== SQS MESSAGE RECEIVED ===")
     print(json.dumps({
-        "ts": datetime.utcnow().isoformat() + "Z",
-        "aws_region": AWS_REGION,
-        "request_id": request_id,
-        "action": action,
-        "source": source,
-        "hsm_host": HSM_HOST,
-        "hsm_port": HSM_PORT
+        "ts": now(),
+        "message_id": message_id,
+        "body_raw": body_raw
     }, ensure_ascii=False))
 
-    check_hsm_connectivity(HSM_HOST, HSM_PORT, CONNECT_TIMEOUT)
+    try:
+        body = json.loads(body_raw)
+    except Exception:
+        body = {"raw_body": body_raw}
+
+    request_id = body.get("request_id", "no-request-id")
+    action = body.get("action", "no-action")
+    source = body.get("source", "unknown")
 
     print(json.dumps({
         "status": "ok",
-        "message": "HSM connection succeeded",
+        "message": "SQS message received by ECS worker",
         "request_id": request_id,
-        "hsm_host": HSM_HOST,
-        "hsm_port": HSM_PORT
+        "action": action,
+        "source": source,
+        "message_id": message_id
     }, ensure_ascii=False))
 
-    print("=== ECS HSM Worker End ===")
+    delete_message(receipt_handle)
+
+    print(json.dumps({
+        "status": "ok",
+        "message": "SQS message deleted",
+        "message_id": message_id
+    }, ensure_ascii=False))
+
+
+def main():
+    print("=== ECS SQS Worker Start ===")
+    print(json.dumps({
+        "ts": now(),
+        "aws_region": AWS_REGION,
+        "queue_url": QUEUE_URL,
+        "wait_time_seconds": WAIT_TIME_SECONDS,
+        "max_number_of_messages": MAX_NUMBER_OF_MESSAGES,
+        "visibility_timeout": VISIBILITY_TIMEOUT
+    }, ensure_ascii=False))
+
+    while True:
+        try:
+            messages = receive_messages()
+
+            if not messages:
+                print(json.dumps({
+                    "ts": now(),
+                    "status": "ok",
+                    "message": "No messages"
+                }, ensure_ascii=False))
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            for message in messages:
+                process_message(message)
+
+        except Exception as e:
+            print(json.dumps({
+                "ts": now(),
+                "status": "ng",
+                "error": str(e)
+            }, ensure_ascii=False))
+            time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
@@ -68,6 +125,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(json.dumps({
             "status": "ng",
-            "error": str(e)
+            "fatal_error": str(e)
         }, ensure_ascii=False))
         sys.exit(1)
